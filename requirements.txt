@@ -1,2 +1,1 @@
-flask
-dnspython
+flask>=3.0

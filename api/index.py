@@ -47,6 +47,12 @@ DOMAIN_RE = re.compile(
     r"^(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.[A-Za-z0-9-]{1,63})+$"
 )
 
+CREATED_CAVEAT = (
+    "This field is the registry's first registration date for the current "
+    "registration. If a domain was allowed to lapse, deleted and re-registered, "
+    "the original date is not published anywhere and cannot be recovered."
+)
+
 DNS_TYPES = ["A", "AAAA", "MX", "NS", "TXT", "CNAME", "SOA"]
 
 
@@ -140,40 +146,39 @@ def rdap_lookup(domain: str):
     def events(kind):
         res = []
         for e in d.get("events") or []:
-            if e.get("eventAction") == kind:
-                res.append(e.get("eventDate"))
+            if e.get("eventAction") == kind and e.get("eventDate"):
+                res.append(e["eventDate"])
         return res
 
     registrar = ""
     for ent in d.get("entities") or []:
-        roles = ent.get("roles") or []
-        if "registrar" in roles:
-            for v in ent.get("vcardArray", [[], []])[1] if ent.get("vcardArray") else []:
-                if v and v[0] == "fn":
-                    registrar = v[3]
+        if "registrar" in (ent.get("roles") or []):
+            vc = ent.get("vcardArray") or [[], []]
+            for row in (vc[1] if len(vc) > 1 else []):
+                if row and row[0] == "fn":
+                    registrar = row[3]
                     break
         if registrar:
             break
-
-    ips = []
-    for e in d.get("events") or []:
-        pass
-    for red in d.get("redacted") or []:
-        pass
 
     ns = []
     for nsd in d.get("nameservers") or []:
         if nsd.get("ldhName"):
             ns.append(nsd["ldhName"].lower().rstrip("."))
 
-    status = d.get("status") or []
+    all_events = [
+        {"action": e.get("eventAction"), "date": e.get("eventDate")}
+        for e in (d.get("events") or []) if e.get("eventDate")
+    ]
+
     return {
         "ok": True,
+        "source": "rdap",
         "handle": d.get("handle"),
         "ldhName": d.get("ldhName"),
         "unicodeName": d.get("unicodeName"),
         "registrar": registrar,
-        "status": status,
+        "status": d.get("status") or [],
         "nameservers": ns,
         "secure_dns": bool(d.get("secureDNS")),
         "created": (events("registration") or [None])[0],
@@ -181,6 +186,139 @@ def rdap_lookup(domain: str):
         "expires": (events("expiration") or [None])[0],
         "port43": d.get("port43"),
     }
+
+
+def _whois_port43(domain, host="whois.iana.org", depth=0):
+    """Raw WHOIS over TCP 43, following the IANA referral. Covers ccTLDs with no RDAP."""
+    try:
+        with socket.create_connection((host, 43), timeout=12) as s:
+            s.settimeout(12)
+            s.sendall(f"{domain}\r\n".encode())
+            buf = b""
+            while len(buf) < 200000:
+                try:
+                    chunk = s.recv(4096)
+                except socket.timeout:
+                    break
+                if not chunk:
+                    break
+                buf += chunk
+        text = buf.decode("utf-8", "replace")
+    except Exception:
+        return None, host
+
+    if depth == 0:
+        m = re.search(r"(?i)^\s*refer:\s*(\S+)", text, re.M)
+        if m:
+            return _whois_port43(domain, m.group(1).strip(), depth + 1)
+    return text, host
+
+
+_WHOIS_FIELDS = {
+    "created": [
+        r"(?i)^\s*(?:creation date|created on|created|registered on|"
+        r"registration time|domain registration date|registered)\s*[:\-]?\s*"
+        r"([^\r\n]{6,40})",
+    ],
+    "updated": [
+        r"(?i)^\s*(?:updated date|last updated|last-update|modified)\s*[:\-]?\s*"
+        r"([^\r\n]{6,40})",
+    ],
+    "expires": [
+        r"(?i)^\s*(?:registry expiry date|expiry date|expires on|expires|"
+        r"expiration date|payable by)\s*[:\-]?\s*([^\r\n]{6,40})",
+    ],
+    "registrar": [
+        r"(?i)^\s*(?:registrar|sponsoring registrar|registrar name)\s*[:\-]\s*"
+        r"([^\r\n]{3,80})",
+    ],
+}
+
+
+def _norm_date(raw):
+    """Normalise the many WHOIS date layouts to ISO where possible."""
+    if not raw:
+        return None
+    s = raw.strip().split("T")[0].strip()
+    s = s.replace("/", "-").replace(".", "-").rstrip("Z")
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})", s)
+    if m:
+        return "%s-%s-%s" % m.groups()
+    m = re.match(r"^(\d{2})-(\d{2})-(\d{4})$", s)
+    if m:
+        return "%s-%s-%s" % (m.group(3), m.group(2), m.group(1))
+    return s or None
+
+
+def whois_lookup(domain: str):
+    text, host = _whois_port43(domain)
+    out = {"ok": False, "server": host}
+    if not text:
+        out["error"] = f"whois unreachable ({host})"
+        return out
+    if re.search(r"(?i)no match|not found|no entries found|no data found", text):
+        out["error"] = "domain not found in whois"
+        return out
+
+    data = {}
+    for field, patterns in _WHOIS_FIELDS.items():
+        for pat in patterns:
+            m = re.search(pat, text, re.M)
+            if m:
+                data[field] = _norm_date(m.group(1))
+                break
+    ns = sorted(set(
+        re.findall(r"(?i)^\s*(?:nserver|name server|nameserver)\s*[:\-]\s*([a-z0-9.\-]+\.[a-z]{2,})",
+                   text, re.M)))
+    status = sorted(set(
+        re.findall(r"(?i)\b(clienthold|clienttransferprohibited|clientupdateprohibited|"
+                   r"clientdeleteprohibited|serverhold|servertransferprohibited|"
+                   r"serverupdateprohibited|serverdeleteprohibited|ok|active)\b",
+                   text)))
+    data["nameservers"] = ns[:20]
+    data["status"] = status
+    out.update({"ok": True, **data})
+    return out
+
+
+def _same_day(a, b):
+    """Compare two ISO-ish timestamps by calendar day only."""
+    if not a or not b:
+        return None
+    return str(a)[:10] == str(b)[:10]
+
+
+def registration_lookup(domain: str, cross_check=True):
+    """Resolve registration data, preferring RDAP and falling back to WHOIS.
+
+    RDAP is registry-authoritative and agrees with WHOIS where both exist, but
+    many ccTLDs (.io, .in, ...) publish no RDAP at all - those need the
+    port-43 WHOIS fallback.
+    """
+    r = rdap_lookup(domain)
+    w = whois_lookup(domain) if (cross_check or not r.get("ok")) else {"ok": False}
+
+    if r.get("ok"):
+        if w.get("ok") and w.get("created"):
+            if _same_day(r.get("created"), w["created"]) is False:
+                r["created_discrepancy"] = {
+                    "rdap": r.get("created"), "whois": w.get("created"),
+                    "note": "sources disagree; RDAP is registry-authoritative",
+                }
+        r["created_verified"] = bool(w.get("ok"))
+        r["created_source"] = "rdap"
+        r["whois"] = {k: v for k, v in w.items()
+                      if k in ("ok", "server", "error", "status", "nameservers")}
+        return r
+
+    if w.get("ok"):
+        w["created_source"] = "whois"
+        w["created_verified"] = True
+        w["note"] = "no RDAP for this TLD; taken from port-43 WHOIS"
+        return w
+
+    return {"ok": False, "error": r.get("error") or w.get("error") or "no data",
+            "rdap_error": r.get("error"), "whois_error": w.get("error")}
 
 
 # ── DNS over HTTPS ────────────────────────────────────────────────────────────
@@ -445,7 +583,13 @@ def r_whois():
     d = _domain_arg()
     if err_msg := validate(d):
         return err("INVALID_DOMAIN", err_msg)
-    return ok(rdap_lookup(d))
+    cross = request.args.get("cross_check", "1") not in ("0", "false", "no")
+    reg = registration_lookup(d, cross_check=cross)
+    if not reg.get("ok"):
+        return err("REGISTRY_UNAVAILABLE",
+                   reg.get("error") or "no registration data", 502)
+    reg["created_caveat"] = CREATED_CAVEAT
+    return ok(reg)
 
 
 @app.route("/api/domain/dns", methods=["GET", "OPTIONS"])
@@ -501,8 +645,10 @@ def r_info():
         "domain": d,
         "resolved_ips": ips,
         "ip_count": len(ips),
-        "registration": rdap_lookup(d),
+        "registration": registration_lookup(
+            d, cross_check=request.args.get("cross_check", "1") not in ("0", "false", "no")),
     }
+    pd["registration"]["created_caveat"] = CREATED_CAVEAT
     pd["dns"] = dns_lookup(d)
     pd["emails_found"] = extract_emails(pd["dns"])
     pd["subdomains"] = crt_subdomains(d)

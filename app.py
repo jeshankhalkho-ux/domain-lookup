@@ -39,8 +39,9 @@ def _env_num(name, default, cast=float):
         return cast(default)
 
 
+# Open by default — no API key required.
+# Set API_KEY env var to enable authentication.
 API_KEY = os.environ.get("API_KEY", "").strip()
-ALLOW_PUBLIC = os.environ.get("ALLOW_PUBLIC", "") == "1"
 ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "").strip().rstrip("/")
 RATE_PER_MIN = _env_num("RATE_LIMIT_PER_MIN", 20, int)
 BUDGET_S = _env_num("TIME_BUDGET_S", 45, float)
@@ -86,14 +87,7 @@ def _rate_wait(ip):
 
 
 def _auth_error():
-    if not API_KEY and not ALLOW_PUBLIC:
-        return _err(503, "Server is not configured: set the API_KEY environment variable "
-                         "(or ALLOW_PUBLIC=1 for an open instance) and redeploy.")
-    if API_KEY:
-        auth = request.headers.get("authorization", "")
-        supplied = request.headers.get("x-api-key") or (auth[7:] if auth.lower().startswith("bearer ") else "")
-        if not hmac.compare_digest(supplied.encode(), API_KEY.encode()):
-            return _err(401, "Missing or invalid API key.")
+    # No authentication required - open by default
     return None
 
 
@@ -114,7 +108,7 @@ def _headers(resp):
 @app.route("/api/health")
 def health():
     return _json({"ok": True, "version": ua.__version__,
-                  "configured": bool(API_KEY or ALLOW_PUBLIC), "auth_required": bool(API_KEY),
+                  "configured": True, "auth_required": bool(API_KEY),
                   "intel_keys": {"virustotal": bool(os.environ.get("VT_API_KEY")),
                                  "safe_browsing": bool(os.environ.get("GSB_API_KEY")),
                                  "urlhaus": bool(os.environ.get("URLHAUS_AUTH_KEY"))}})

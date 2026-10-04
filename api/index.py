@@ -100,7 +100,7 @@ def pick_modules():
     return mods, None
 
 
-def run_lookup():
+def run_lookup(force_modules=None):
     """Returns (report_dict, error_tuple)."""
     raw = request.args.get("domain") or request.args.get("q") or ""
     if not raw.strip():
@@ -110,9 +110,12 @@ def run_lookup():
     except Exception as e:
         return None, ("INVALID_DOMAIN", str(e), 400)
 
-    mods, msg = pick_modules()
-    if mods is None:
-        return None, ("INVALID_MODULE", msg, 400)
+    if force_modules:
+        mods = [m for m in force_modules if m in dl.ALL_MODULES] or ["dns"]
+    else:
+        mods, msg = pick_modules()
+        if mods is None:
+            return None, ("INVALID_MODULE", msg, 400)
     opts, msg = build_opts()
     if opts is None:
         return None, ("DISABLED", msg, 400)
@@ -149,9 +152,12 @@ def index():
         "modules": dl.ALL_MODULES,
         "endpoints": {
             "lookup": "GET /api/domain/lookup?domain=<target>",
-            "report": "GET /api/domain/report?domain=<target>",
+            "report": "GET /api/domain/report?domain=<target>  (formatted text)",
             "health": "GET /api/health",
+            "aliases": "GET /api/domain/<module>?domain=<target> "
+                       "(whois, dns, ssl, http, ip, email, subs, info, findings)",
         },
+        "example": "/api/domain/lookup?domain=github.com&modules=whois,ssl",
         "parameters": {
             "domain": "domain, URL, e-mail address or IP",
             "modules": "comma-separated subset, default all",
@@ -183,7 +189,9 @@ def health():
 def fallback(_p):
     if request.method == "OPTIONS":
         return "", 204
-    return err("NOT_FOUND", "Endpoint not found", 404)
+    return err("NOT_FOUND",
+               "Endpoint not found. Valid: /api/domain/lookup, /api/domain/report, "
+               "/api/health (needs ?domain=<target>)", 404)
 
 
 @app.route("/api/domain/lookup", methods=["GET", "OPTIONS"])
@@ -262,6 +270,37 @@ def r_report():
     if request.args.get("format", "text").lower() == "json":
         return ok(rep)
     return Response(text_report(rep), mimetype="text/plain; charset=utf-8")
+
+
+# ── Backwards-compatible aliases ──────────────────────────────────────────────
+# The earlier HTTP version of this repo exposed /api/domain/<name> for each
+# module plus /api/domain/info. Map those onto lookup() so old URLs keep working.
+ALIASES = {"info": None, "whois": "whois", "dns": "dns", "ssl": "ssl",
+           "subs": "subs", "email": "email", "ip": "ip", "http": "http",
+           "findings": None}
+
+
+def _alias_view(module):
+    def view():
+        if request.method == "OPTIONS":
+            return "", 204
+        rep, e = run_lookup(force_modules=[module] if module else None)
+        if e:
+            return err(e[0], e[1], e[2])
+        rep = strip_non_json(rep)
+        if request.args.get("format", "json").lower() == "text":
+            return Response(text_report(rep), mimetype="text/plain; charset=utf-8")
+        return ok(rep)
+    return view
+
+
+for _name, _mod in ALIASES.items():
+    app.add_url_rule("/api/domain/" + _name, "alias_" + _name,
+                     _alias_view(_mod), methods=["GET", "OPTIONS"])
+
+# tolerate the /lookup suffix and the bare /api/domain path too
+app.add_url_rule("/api/lookup", "alias_lookup", r_lookup, methods=["GET", "OPTIONS"])
+app.add_url_rule("/api/domain", "alias_domain", r_lookup, methods=["GET", "OPTIONS"])
 
 
 if __name__ == "__main__":

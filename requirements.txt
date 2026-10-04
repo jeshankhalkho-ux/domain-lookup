@@ -1,4 +1,2 @@
-# Optional - domain_lookup.py runs on the standard library alone.
-# Install these for native DNS resolution and exact public-suffix handling.
+flask
 dnspython
-tldextract

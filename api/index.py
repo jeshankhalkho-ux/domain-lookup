@@ -35,7 +35,7 @@ import urllib.parse
 import warnings
 
 import requests as rq
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, request
 
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
 MAX_IPS = int(os.getenv("MAX_IPS", "6"))
@@ -1253,7 +1253,314 @@ def analyze(m):
     return F
 
 
-# ══════════════════════════════════════════════════════════════ scan orchestration
+# ══════════════════════════════════════════════════════════════ presentation
+SEV_WEIGHT = {"high": 25, "medium": 10, "low": 3, "info": 0}
+
+
+def human_duration(days):
+    """Turn a day count into something a person reads faster: '18.9 years'."""
+    if days is None:
+        return None
+    d = abs(int(days))
+    sign = "-" if days < 0 else ""
+    if d < 1:
+        return "today"
+    if d < 45:
+        return "%s%d days" % (sign, d)
+    if d < 365:
+        return "%s%d months" % (sign, round(d / 30.44))
+    if d < 3650:
+        return "%s%.1f years" % (sign, d / 365.25)
+    return "%s%.1f decades" % (sign, d / 3652.5)
+
+
+def date_only(s):
+    if not s:
+        return None
+    m = re.match(r"(\d{4}-\d{2}-\d{2})", str(s))
+    return m.group(1) if m else str(s)[:10]
+
+
+def trim(values, keep=6):
+    """Shorten long lists but say how many were dropped - no silent truncation."""
+    if not isinstance(values, list):
+        return values, None
+    return values[:keep], (len(values) - keep if len(values) > keep else 0)
+
+
+def risk_score(findings, age_days=None):
+    score = 100
+    for f in findings:
+        score -= SEV_WEIGHT.get(f.get("severity"), 0)
+    # very new domains are a risk signal on their own
+    if age_days is not None and 0 <= age_days < 60:
+        score -= 10
+    score = max(0, min(100, score))
+    band = ("critical" if score < 40 else "poor" if score < 70
+            else "fair" if score < 90 else "good")
+    return score, band
+
+
+def build_digest(t, m, findings):
+    """Compact, human-readable view. Full raw data stays available via ?view=full."""
+    w = m.get("whois") or {}
+    d = m.get("dns") or {}
+    s = m.get("tls") or {}
+    h = m.get("http") or {}
+    e = m.get("email") or {}
+    ip = m.get("ip") or {}
+    sub = m.get("subs") or {}
+
+    reg = w.get("registrar")
+    reg_name = reg.get("name") if isinstance(reg, dict) else reg
+
+    recs = d.get("records", {}) or {}
+    ipv4 = [x["value"] for x in recs.get("A", []) if is_public_ip(x["value"])]
+    ipv6 = [x["value"] for x in recs.get("AAAA", [])]
+
+    first = (ip.get("addresses") or [{}])[0]
+    asn = first.get("asn") or {}
+    geo = first.get("geo") or {}
+    asn_txt = None
+    if asn:
+        asn_txt = "%s %s" % (", ".join(asn.get("asn") or []), asn.get("name") or "")
+        asn_txt = asn_txt.strip()
+
+    https = h.get("https", {}) or {}
+    sec = https.get("security", {}) or {}
+    protos = [k for k, v in (s.get("protocols") or {}).items() if v == "accepted"]
+    tech = https.get("technologies") or []
+    tech, _ = trim([t for t in tech if not t.startswith("server:")], 8)
+
+    mx = e.get("mx") or []
+    subs = sub.get("subdomains") or []
+    hosts = [x["host"] for x in subs]
+    hosts, more_hosts = trim(hosts, 8)
+
+    dangling = sub.get("dangling_candidates") or []
+    score, band = risk_score(findings, w.get("age_days"))
+
+    return {
+        "domain": t["registrable"],
+        "host": t["host"],
+        "risk": {
+            "score": score,
+            "band": band,
+            "counts": {k: sum(1 for f in findings if f["severity"] == k) for k in SEV},
+            "total": len(findings),
+        },
+        "registration": None if w.get("skipped") else {
+            "created": date_only(w.get("created_iso") or w.get("created")),
+            "age": human_duration(w.get("age_days")),
+            "expires": date_only(w.get("expires_iso") or w.get("expires")),
+            "expires_in": human_duration(w.get("days_to_expiry")),
+            "registrar": reg_name,
+            "status": w.get("status") or [],
+            "nameservers": (w.get("nameservers") or [])[:4],
+            "nameservers_more": max(0, len(w.get("nameservers") or []) - 4),
+            "source": w.get("created_source"),
+            "verified": w.get("created_verified"),
+        },
+        "infrastructure": {
+            "ipv4": ipv4[:4],
+            "ipv6_count": len(ipv6),
+            "asn": asn_txt,
+            "asn_prefix": asn.get("prefix"),
+            "hosting": first.get("hosting_hint"),
+            "location": ", ".join(x for x in [geo.get("city"), geo.get("country")] if x) or None,
+            "ptr": (first.get("ptr") or [None])[0],
+            "dnssec": (d.get("dnssec") or {}).get("signed"),
+            "caa": [x["value"] for x in recs.get("CAA", [])][:4],
+            "wildcard_dns": d.get("wildcard"),
+        },
+        "tls": None if s.get("skipped") else {
+            "issuer": s.get("issuer_org") or s.get("issuer_cn"),
+            "valid_to": date_only(s.get("valid_to")),
+            "days_left": s.get("days_left"),
+            "protocols": protos,
+            "legacy_protocols": [k for k in ("TLSv1.0", "TLSv1.1")
+                                 if (s.get("protocols") or {}).get(k) == "accepted"],
+            "cipher": (s.get("cipher") or {}).get("name"),
+            "alpn": s.get("alpn"),
+            "verified": s.get("verified"),
+            "self_signed": s.get("self_signed"),
+            "wildcard_cert": s.get("wildcard"),
+            "san_count": s.get("san_count"),
+        },
+        "web": None if h.get("skipped") else {
+            "status": https.get("status"),
+            "title": https.get("title"),
+            "server": (https.get("headers") or {}).get("server"),
+            "redirects": len(https.get("chain") or []),
+            "http_redirects_to_https": h.get("http_redirects_to_https"),
+            "insecure_tls_used": https.get("insecure_tls_used"),
+            "technologies": tech,
+            "security_score": sec.get("score"),
+            "security_issues": (sec.get("issues") or [])[:6],
+            "cookies_weak": [c["name"] for c in (https.get("cookies") or [])
+                             if not c["secure"] or not c["httponly"]][:6],
+            "security_txt": (h.get("files") or {}).get("security_txt"),
+            "robots_txt": (h.get("files") or {}).get("robots_txt"),
+        },
+        "email_security": None if e.get("skipped") else {
+            "mx_count": len(mx),
+            "mx_provider": e.get("mx_provider"),
+            "null_mx": e.get("null_mx"),
+            "spf_present": (e.get("spf") or {}).get("present"),
+            "spf_policy": (e.get("spf") or {}).get("policy"),
+            "spf_lookups": (e.get("spf") or {}).get("lookups"),
+            "dmarc_present": (e.get("dmarc") or {}).get("present"),
+            "dmarc_policy": (e.get("dmarc") or {}).get("policy"),
+            "dkim_selectors": len(e.get("dkim_selectors_found") or []),
+            "mta_sts": bool((e.get("mta_sts") or {}).get("dns")),
+            "tls_rpt": bool(e.get("tls_rpt")),
+            "bimi": bool(e.get("bimi")),
+        },
+        "subdomains": None if sub.get("skipped") else {
+            "total": sub.get("total"),
+            "resolved_checked": sub.get("resolved_checked"),
+            "sources": {k: v for k, v in (sub.get("sources") or {}).items()},
+            "sample": hosts,
+            "sample_omitted": more_hosts or 0,
+            "dangling_cname": [{"host": x["host"], "target": x.get("cname"),
+                                "risk": x.get("takeover_hint")}
+                               for x in dangling[:5]],
+        },
+        "findings": findings,
+        "errors": {k: v.get("error") for k, v in m.items()
+                   if isinstance(v, dict) and v.get("error")},
+        "_full": "append &view=full for raw module data",
+    }
+
+
+SEV_LABEL = {"high": "HIGH", "medium": "MEDIUM", "low": "LOW", "info": "INFO"}
+
+
+def render_report(t, digest):
+    """Plain-text report - readable without a JSON viewer."""
+    L = []
+    add = L.append
+    r = digest["risk"]
+    add("=" * 68)
+    add("  DOMAIN INTELLIGENCE REPORT")
+    add("  %s" % digest["domain"])
+    add("=" * 68)
+    add("")
+    add("  RISK  %d/100 (%s)   %d high  %d medium  %d low  %d info"
+        % (r["score"], r["band"].upper(), r["counts"]["high"], r["counts"]["medium"],
+           r["counts"]["low"], r["counts"]["info"]))
+    add("")
+
+    def section(title, rows):
+        rows = [(k, v) for k, v in rows if v not in (None, "", [], {})]
+        if not rows:
+            return
+        add("-- %s " % title + "-" * max(0, 64 - len(title)))
+        for k, v in rows:
+            add("  %-18s %s" % (k, v))
+        add("")
+
+    g = digest.get("registration") or {}
+    section("REGISTRATION", [
+        ("created", g.get("created")),
+        ("age", g.get("age")),
+        ("expires", g.get("expires")),
+        ("expires in", g.get("expires_in")),
+        ("registrar", g.get("registrar")),
+        ("status", ", ".join(g.get("status") or []) or None),
+        ("nameservers", ", ".join(g.get("nameservers") or []) or None),
+        ("date source", "%s (verified=%s)" % (g.get("source"), g.get("verified"))
+            if g.get("source") else None),
+    ])
+
+    i = digest.get("infrastructure") or {}
+    section("INFRASTRUCTURE", [
+        ("ipv4", ", ".join(i.get("ipv4") or []) or None),
+        ("asn", i.get("asn")),
+        ("asn prefix", i.get("asn_prefix")),
+        ("hosting", i.get("hosting")),
+        ("location", i.get("location")),
+        ("reverse dns", i.get("ptr")),
+        ("dnssec", "signed" if i.get("dnssec") else "not signed"),
+        ("wildcard dns", i.get("wildcard_dns")),
+        ("caa", ", ".join(i.get("caa") or []) or None),
+    ])
+
+    s = digest.get("tls") or {}
+    section("TLS CERTIFICATE", [
+        ("issuer", s.get("issuer")),
+        ("valid to", "%s (%s days left)" % (s.get("valid_to"), s.get("days_left"))
+            if s.get("valid_to") else None),
+        ("protocols", ", ".join(s.get("protocols") or []) or None),
+        ("legacy accepted", ", ".join(s.get("legacy_protocols") or []) or None),
+        ("cipher", s.get("cipher")),
+        ("alpn", s.get("alpn")),
+        ("verified", s.get("verified")),
+        ("self signed", s.get("self_signed")),
+        ("wildcard", s.get("wildcard_cert")),
+        ("sans", s.get("san_count")),
+    ])
+
+    w = digest.get("web") or {}
+    section("WEB", [
+        ("status", w.get("status")),
+        ("title", w.get("title")),
+        ("server", w.get("server")),
+        ("redirects", w.get("redirects")),
+        ("http->https", w.get("http_redirects_to_https")),
+        ("insecure tls", w.get("insecure_tls_used")),
+        ("technologies", ", ".join(w.get("technologies") or []) or None),
+        ("security score", "%s/100" % w.get("security_score") if w.get("security_score") is not None else None),
+        ("header issues", "; ".join(w.get("security_issues") or []) or None),
+        ("weak cookies", ", ".join(w.get("cookies_weak") or []) or None),
+        ("security.txt", w.get("security_txt")),
+        ("robots.txt", w.get("robots_txt")),
+    ])
+
+    e = digest.get("email_security") or {}
+    section("EMAIL SECURITY", [
+        ("mx provider", ", ".join(e.get("mx_provider") or []) or None),
+        ("mx records", e.get("mx_count")),
+        ("spf", ("%s (%s lookups)" % (e.get("spf_policy"), e.get("spf_lookups"))
+                 if e.get("spf_present") else "absent")),
+        ("dmarc", e.get("dmarc_policy") if e.get("dmarc_present") else "absent"),
+        ("dkim selectors", e.get("dkim_selectors")),
+        ("mta-sts", e.get("mta_sts")),
+        ("tls-rpt", e.get("tls_rpt")),
+        ("bimi", e.get("bimi")),
+    ])
+
+    sd = digest.get("subdomains") or {}
+    section("SUBDOMAINS", [
+        ("total found", sd.get("total")),
+        ("resolved", sd.get("resolved_checked")),
+        ("sources", ", ".join("%s=%s" % (k, v) for k, v in (sd.get("sources") or {}).items()) or None),
+        ("dangling cname", len(sd.get("dangling_cname") or []) or None),
+    ])
+    if sd.get("sample"):
+        add("  sample:")
+        for hst in sd["sample"]:
+            add("    - %s" % hst)
+        if sd.get("sample_omitted"):
+            add("    ... and %d more" % sd["sample_omitted"])
+        add("")
+
+    if digest.get("findings"):
+        add("-- FINDINGS " + "-" * 56)
+        for f in digest["findings"]:
+            add("  [%-6s] %-6s %s" % (SEV_LABEL.get(f["severity"], "?"),
+                                       f["module"], f["message"]))
+        add("")
+
+    if digest.get("errors"):
+        add("-- ERRORS " + "-" * 58)
+        for k, v in digest["errors"].items():
+            add("  %-10s %s" % (k, str(v)[:100]))
+        add("")
+
+    add("=" * 68)
+    return "\n".join(L)
+
 MODFN = {"dns": mod_dns, "tls": mod_tls, "http": mod_http,
          "ip": mod_ip, "email": mod_email, "subs": mod_subs}
 
@@ -1326,10 +1633,12 @@ def index():
         return "", 204
     return jsonify({
         "service": "Domain Intelligence API",
-        "version": "2.0.0",
+        "version": "3.0.0",
         "modules": ALL_MODULES,
         "endpoints": {
-            "info": "GET /api/domain/info?domain=<domain>[&modules=dns,whois,tls,http,ip,email,subs]",
+            "report": "GET /api/domain/report?domain=<domain>   plain-text report",
+            "info": "GET /api/domain/info?domain=<domain>[&view=digest|full]",
+            "findings": "GET /api/domain/findings?domain=<domain>",
             "whois": "GET /api/domain/whois?domain=<domain>",
             "dns": "GET /api/domain/dns?domain=<domain>",
             "subs": "GET /api/domain/subs?domain=<domain>",
@@ -1337,10 +1646,12 @@ def index():
             "email": "GET /api/domain/email?domain=<domain>",
             "ip": "GET /api/domain/ip?domain=<domain>",
             "http": "GET /api/domain/http?domain=<domain>",
-            "findings": "GET /api/domain/findings?domain=<domain>",
             "health": "GET /api/health",
         },
         "notes": {
+            "view": "/info returns a compact digest by default; use &view=full for raw data",
+            "report": "/report returns a formatted plain-text report - easiest to read",
+            "modules": "add &modules=dns,whois,tls to scan only what you need",
             "cross_check": "append &cross_check=0 to skip the second WHOIS lookup",
             "passive": "no crawling and no brute force; one DNS/TLS/HTTP request per target",
         },
@@ -1372,22 +1683,45 @@ def r_info():
     except ValueError as ex:
         log_monitor("/api/domain/info", 400, time.time() - t0, str(ex))
         return err("INVALID_INPUT", str(ex))
+    view = request.args.get("view", "digest").lower()
     m = run_modules(t, mods)
     findings = analyze(m)
-    counts = {k: sum(1 for f in findings if f["severity"] == k) for k in SEV}
-    pd = {
-        "domain": t["registrable"], "host": t["host"], "unicode": t["unicode"],
-        "is_ip": t["is_ip"], "modules": mods,
-        "summary": {"finding_counts": counts, "total_findings": len(findings),
-                    "worst_severity": findings[0]["severity"] if findings else None},
-        "findings": findings,
-        "data": m,
-    }
     elapsed = round((time.time() - t0) * 1000)
+
+    if view == "full":
+        counts = {k: sum(1 for f in findings if f["severity"] == k) for k in SEV}
+        pd = {"domain": t["registrable"], "host": t["host"], "unicode": t["unicode"],
+              "is_ip": t["is_ip"], "view": "full", "modules": mods,
+              "summary": {"finding_counts": counts, "total_findings": len(findings),
+                          "worst_severity": findings[0]["severity"] if findings else None},
+              "findings": findings, "data": m}
+    else:
+        pd = build_digest(t, m, findings)
+        pd["modules"] = mods
+
     log_monitor("/api/domain/info", 200, elapsed)
     resp = jsonify({"rs": "S", "rc": "OK", "rd": "Success", "pd": pd})
     resp.headers["X-Elapsed-Ms"] = str(elapsed)
     return resp, 200
+
+
+@app.route("/api/domain/report", methods=["GET", "OPTIONS"])
+def r_report():
+    global CROSS_CHECK
+    CROSS_CHECK = request.args.get("cross_check", "1") not in ("0", "false", "no")
+    if request.method == "OPTIONS":
+        return "", 204
+    try:
+        t = target_arg()
+        mods = wanted_modules()
+    except ValueError as ex:
+        return err("INVALID_INPUT", str(ex))
+    m = run_modules(t, mods)
+    findings = analyze(m)
+    text = render_report(t, build_digest(t, m, findings))
+    if request.args.get("format", "text").lower() == "json":
+        return ok(build_digest(t, m, findings))
+    return Response(text, mimetype="text/plain; charset=utf-8")
 
 
 @app.route("/api/domain/findings", methods=["GET", "OPTIONS"])
@@ -1403,8 +1737,10 @@ def r_findings():
         return err("INVALID_INPUT", str(ex))
     m = run_modules(t, mods)
     f = analyze(m)
-    return ok({"domain": t["registrable"], "modules": mods, "total": len(f), "findings": f,
-               "counts": {k: sum(1 for x in f if x["severity"] == k) for k in SEV}})
+    counts = {k: sum(1 for x in f if x["severity"] == k) for k in SEV}
+    score, band = risk_score(f, (m.get("whois") or {}).get("age_days"))
+    return ok({"domain": t["registrable"], "modules": mods, "total": len(f),
+               "risk_score": score, "risk_band": band, "counts": counts, "findings": f})
 
 
 def _single(module, fn):

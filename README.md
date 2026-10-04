@@ -1,81 +1,81 @@
-# Domain Intelligence API
+# Domain Lookup
 
-Passive domain reconnaissance in one call. No API keys, no signup — every data
-source is free and public.
+All-in-one domain intelligence lookup — passive reconnaissance with a
+severity-rated findings engine.
 
-## What it returns
+`domain_lookup.py` is a standalone CLI. It runs on the **standard library
+alone**; `dnspython` and `tldextract` are optional and only make it faster /
+more precise.
 
-| Section | Source | Data |
-|---|---|---|
-| `registration` | RDAP (`rdap.org`) | registrar, status, creation/expiry dates, nameservers, DNSSEC |
-| `dns` | Google DoH | A, AAAA, MX, NS, TXT, CNAME, SOA + extracted emails |
-| `subdomains` | crt.sh | certificate-transparency discovered subdomains |
-| `tls` | direct handshake | issuer, subject, SANs, expiry, SHA-1/SHA-256 fingerprints, cipher |
-| `http` | direct request | status, redirect chain, title, server, tech fingerprint, security headers |
-| `geo` | ipwho.is | IP → country/city/ASN/ISP |
+## Modules
 
-## Endpoints
+| Module | What it collects |
+|---|---|
+| `dns` | A/AAAA/CNAME/MX/NS/TXT/SOA/CAA, NS glue addresses, DNSSEC (DS/DNSKEY), wildcard-DNS test |
+| `whois` | RDAP via the IANA bootstrap, raw WHOIS (port 43) fallback, domain age, days-to-expiry, registrar, status flags, abuse contact |
+| `ssl` | TLS handshake, certificate details, SANs, expiry, hostname match, protocol support (TLS 1.0-1.3), cipher, ALPN (h2), SHA-256/SHA-1 fingerprints |
+| `http` | http/https redirect chains, response headers, security-header audit, cookie flags, page title, technology/CDN hints, robots.txt, security.txt |
+| `ip` | per-IP reverse DNS, ASN + prefix (Team Cymru over DNS), geolocation, hosting hint |
+| `email` | MX provider, SPF (recursive lookup count), DMARC, DKIM (common selectors), MTA-STS, TLS-RPT, BIMI |
+| `subs` | passive subdomains (crt.sh, HackerTarget, AlienVault OTX), resolution, dangling-CNAME hints, optional DNS brute force |
 
-```
-GET /api/domain/info?domain=example.com     everything (composite)
-GET /api/domain/whois?domain=example.com    registration only
-GET /api/domain/dns?domain=example.com      DNS records only
-GET /api/domain/subdomains?domain=...       crt.sh subdomains only
-GET /api/domain/ssl?domain=example.com      TLS certificate only
-GET /api/health
-```
-
-Input is normalised, so all of these work:
-```
-example.com
-https://example.com/path?q=1
-EXAMPLE.COM:443
-```
-
-## Run locally
+## Install
 
 ```bash
-pip install -r requirements.txt
-python api/index.py          # http://127.0.0.1:5060
+pip install -r requirements.txt   # optional accelerators
 ```
 
-## Deploy
+The script runs without them.
 
-`vercel.json` is already configured for `@vercel/python`. Import the repo in
-Vercel and pick the Python preset — no build settings needed.
-
-## Example
+## Usage
 
 ```bash
-curl "http://127.0.0.1:5060/api/domain/info?domain=github.com"
+python domain_lookup.py example.com
+python domain_lookup.py https://www.example.co.uk/path -m dns,whois,ssl
+python domain_lookup.py example.com --brute --wordlist words.txt
+python domain_lookup.py -l domains.txt --json -o results.json
+python domain_lookup.py 1.1.1.1                    # IP targets: rDNS, ASN, geo, TLS, HTTP
+python domain_lookup.py example.com --no-color      # plain output for piping
 ```
 
-```json
-{
-  "rs": "S", "rc": "OK", "pd": {
-    "domain": "github.com",
-    "resolved_ips": ["20.207.73.82"],
-    "registration": {
-      "registrar": "MarkMonitor Inc.",
-      "created": "2007-10-09T18:20:50Z",
-      "expires": "2028-10-09T18:20:50Z",
-      "nameservers": ["dns1.p08.nsone.net", "..."]
-    },
-    "subdomains": { "count": 118 },
-    "tls": { "issuer": {"organizationName": "Sectigo Limited"}, "days_until_expiry": 57 },
-    "http": { "status": 200, "security_score": 83 },
-    "geo": [{ "ip": "20.207.73.82", "city": "Pune", "org": "Microsoft Corporation" }]
-  }
-}
+### Options
+
 ```
+-m, --modules      comma-separated modules (default: all)
+-l, --list         file with one target per line
+--json             print JSON instead of the formatted report
+-o, --output       also save the full results as JSON
+--timeout          network timeout in seconds (default 8)
+--resolver IP      use a specific DNS server (needs dnspython)
+--doh              force DNS-over-HTTPS
+--tls-port PORT    TLS port to probe (default 443)
+--raw-whois        include the raw WHOIS text
+--brute            DNS brute force using the built-in wordlist
+--wordlist FILE    custom wordlist for --brute
+--max-resolve N    cap on subdomains resolved (default 300)
+--max-ips N        cap on IPs profiled per target (default 8)
+--threads N        concurrency for resolution/brute force (default 30)
+--no-color         disable ANSI colour
+```
+
+## Findings
+
+Every run produces severity-rated findings:
+
+```
+  [MEDIUM] http     Plain HTTP does not redirect to HTTPS
+  [LOW   ] email    SPF ends in +all (anyone can send as this domain)
+  [INFO  ] dns      No IPv6 (AAAA) records
+```
+
+Severities: `high`, `medium`, `low`, `info`.
 
 ## Notes
 
-- `security_score` = percentage of the 6 checked headers present
-  (`strict-transport-security`, `content-security-policy`, `x-frame-options`,
-  `x-content-type-options`, `referrer-policy`, `permissions-policy`)
-- Private/loopback/link-local IPs are filtered out, so the API can't be used to
-  probe internal networks
-- crt.sh is often rate-limited; that section retries 3× and reports
-  `{"ok": false, "error": ...}` instead of failing the whole request
-- Composite `/info` takes ~20s because it fans out to six upstreams
+- Everything is passive or ordinary client traffic: DNS queries, public APIs,
+  one TLS/HTTP connection per target. The optional `--brute` flag sends one DNS
+  query per wordlist entry.
+- The `created` date is the registry's first registration date for the *current*
+  registration. If a domain lapsed, was deleted and re-registered, the original
+  date is not published anywhere and cannot be recovered.
+- Only run this against domains you own or are authorised to assess.
